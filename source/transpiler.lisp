@@ -1,8 +1,8 @@
-(defpackage #:ck-lit/cpp
+(defpackage #:ck-lli-cpp-transpiler
   (:use #:cl #:ck-clle)
   (:export #:transpile))
 
-(in-package #:ck-lit/cpp)
+(in-package #:ck-lli-cpp-transpiler)
 
 ;; Operators are Lisp functions, macros, or special operators.
 ;; Routines are operators which also have a function lambda expression.  This means that we can
@@ -28,7 +28,7 @@
 (defvar *entry-point-function-sym* nil)
 (defvar *ignored-ops* (make-hash-table))
 
-(defparameter +namespace-prefix+ "ck_lit_cpp")
+(defparameter +namespace-prefix+ "ck_lli_cpp")
 (defparameter +indentation+ "  ")
 
 (defun transpile (entry-point-function-symbol &optional (destination *standard-output*))
