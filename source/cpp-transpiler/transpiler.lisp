@@ -29,7 +29,7 @@
 (defvar *ignored-ops* (make-hash-table))
 
 (defparameter +namespace-prefix+ "ck_lit_cpp")
-(defparameter +indentation-whitespaces+ 2)
+(defparameter +indentation+ "  ")
 
 (defun transpile (entry-point-function-symbol &optional (destination *standard-output*))
   "Transpile a Lisp function to a target language and save to a file or write to a stream.
@@ -68,8 +68,8 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                               (format nil "~%~%~A {~%~A~%}"
                                       (routine-signature routine)
                                       (ck-clle/string:indent (routine-body routine)
-                                                             (indentation 1)))
-                              (indentation 1)))))
+                                                             +indentation+))
+                              +indentation+))))
                  *routine-table*)
         (let ((ns-defs (get-output-stream-string namespace)))
           (unless (string-empty-p ns-defs)
@@ -82,7 +82,7 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                   "int argc, char* argv[]"))
       (format destination "~A"
               (ck-clle/string:indent (routine-body (routine *entry-point-function-sym*))
-                                     (indentation 1)))
+                                     +indentation+))
       (format destination "~%}"))))
 
 (defun routine (sym)
@@ -113,14 +113,6 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                          gensym-number
                          cleaned-string)))
     result))
-
-(defvar *indentation-level* 0)
-
-(defun indentation (&optional level)
-  (let ((level (or level *indentation-level*)))
-    (if (zerop level)
-        ""
-        (format nil "~VT" (* level +indentation-whitespaces+)))))
 
 (defun verbose-symbol-name (sym)
   (format nil "~A from ~A"
@@ -165,7 +157,6 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
            (let ((routine (routine car)))
              (if (nullp routine)
                  (let ((*should-return-result* t)
-                       (*indentation-level* 0)
                        (*is-toplevel-expression* t))
                    (setf routine (transpile-routine car))))
              (labels ((routine-expansion (name args)
@@ -345,23 +336,21 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
       (destructuring-bind (name &rest args) args
         (declare (ignore name))
         (concatenate 'string
-         (let ((*indentation-level* (1+ *indentation-level*)))
-           (format nil "{~{~%~A~%~}"
-                  (mapcar (lambda (arg)
-                            (format nil "~A~A" (indentation) arg))
-                          (expand-args args))))
-         (format nil "~A}" (indentation))))))
+                     (format nil "{~{~%~A~}"
+                             (mapcar (lambda (arg)
+                                       (ck-clle/string:indent (format nil "~A" arg) +indentation+))
+                                     (expand-args args)))
+                     (format nil "~%}")))))
 
 (define-control-op 'cl:if
     (lambda (args)
       (destructuring-bind (cond-expr then-expr &optional else-expr) args
         (cond
           ((and then-expr else-expr)
-           (format nil "if (~A) ~A~%~Aelse ~A"
+           (format nil "if (~A) ~A~%else ~A"
                    (let ((*is-toplevel-expression* nil))
                      (transpile-form cond-expr))
                    (funcall (op-func 'cl:block) (list nil then-expr))
-                   (indentation)
                    (funcall (op-func 'cl:block) (list nil else-expr))))
           (then-expr
            (format nil "if (~A) ~A"
@@ -386,6 +375,23 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
     (lambda (args)
       (destructuring-bind (cond-expr &rest forms) args
         (funcall (op-func 'cl:when) `((not ,cond-expr) ,@forms)))))
+
+(define-control-op 'cl:let
+  (lambda (args)
+    (destructuring-bind (bindings &rest body) args
+      (let ((cpp-bindings
+              (loop for binding in bindings
+                    collect (format nil "auto ~A = [~{~A~^, ~}]() ~A();"
+                                    (cpp-argnamicate (car binding))
+                                    (mapcar #'cpp-argnamicate *routine-args*)
+                                    (let ((*should-return-result* t))
+                                      (funcall (op-func 'cl:block)
+                                               `(nil ,(cadr binding))))))))
+        (format nil "~{~A~^~%~}~%~A"
+                cpp-bindings
+                (let ((*routine-args*
+                        (append *routine-args* (mapcar #'car bindings))))
+                  (funcall (op-func 'cl:block) `(nil ,@body))))))))
 
 ;;; IGNORED OPERATORS
 
