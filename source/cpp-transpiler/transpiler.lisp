@@ -26,6 +26,7 @@
 (defvar *routine-table* (make-hash-table))
 (defvar *op-table* (make-hash-table))
 (defvar *entry-point-function-sym* nil)
+(defvar *ignored-ops* (make-hash-table))
 
 (defparameter +namespace-prefix+ "ck_lit_cpp")
 (defparameter +indentation-whitespaces+ 2)
@@ -367,3 +368,34 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                    (let ((*is-toplevel-expression* nil))
                      (transpile-form cond-expr))
                    (funcall (op-func 'cl:block) (list nil then-expr))))))))
+
+(define-control-op 'cl:progn
+    (lambda (args)
+      (destructuring-bind (&rest forms) args
+        (funcall (op-func 'cl:block) `(nil ,@forms)))))
+
+(define-control-op 'cl:when
+  (lambda (args)
+    (destructuring-bind (cond-expr &rest forms) args
+      (format nil "if (~A) ~A"
+              (let ((*is-toplevel-expression* nil))
+                (transpile-form cond-expr))
+              (funcall (op-func 'cl:block) `(nil ,@forms))))))
+
+(define-control-op 'cl:unless
+    (lambda (args)
+      (destructuring-bind (cond-expr &rest forms) args
+        (funcall (op-func 'cl:when) `((not ,cond-expr) ,@forms)))))
+
+;;; IGNORED OPERATORS
+
+(defmacro ignore-op-symbols (&rest op-syms)
+  `(progn
+     ,@(mapcar (lambda (op-sym)
+                 `(setf (gethash ',op-sym *ignored-ops*) t))
+               op-syms)))
+
+(defun ignored-op-symbol-p (op-sym)
+  (gethash op-sym *ignored-ops*))
+
+(ignore-op-symbols cl:declare)
