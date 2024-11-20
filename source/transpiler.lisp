@@ -272,116 +272,125 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
     (format t "~&; ~A overwritten with ~A" existing-op op))
   (setf (gethash (op-symbol op) *op-table*) op))
 
-(defun define-expr-op (sym lambda)
-  (register-op (make-instance 'expression-op :symbol sym :lambda lambda)))
-
-(defun define-control-op (sym lambda)
-  (register-op (make-instance 'control-op :symbol sym :lambda lambda)))
-
 (defun op-func (op-sym)
   (op-lambda (gethash op-sym *op-table*)))
 
+(defmacro define-expr-op (sym args-binding &body body)
+  `(register-op (make-instance 'expression-op
+                               :symbol ,sym
+                               :lambda (lambda ,args-binding
+                                         ,@body))))
+
+(defmacro define-control-op (sym args-binding &body body)
+  `(register-op (make-instance 'control-op
+                               :symbol ,sym
+                               :lambda (lambda ,args-binding
+                                         ,@body))))
+
 ;;; EXPRESSION OPERATORS
 
-(define-expr-op 'cl:+
-    (lambda (args)
-      (if (nullp args)
-          "0"
-          (format nil "(~{~A~^ + ~})" (expand-args args)))))
+(define-expr-op 'cl:+ (args)
+  (if (nullp args)
+      "0"
+      (format nil "(~{~A~^ + ~})" (expand-args args))))
 
-(define-expr-op 'cl:-
-    (lambda (args)
-      (if (nullp args)
-          "0"
-          (if (= (length args) 1)
-              (format nil "(-~A)" (car args))
-              (format nil "(~{~A~^ - ~})" (expand-args args))))))
+(define-expr-op 'cl:- (args)
+  (if (nullp args)
+      "0"
+      (if (= (length args) 1)
+          (format nil "(-~A)" (car args))
+          (format nil "(~{~A~^ - ~})" (expand-args args)))))
 
-(define-expr-op 'cl:*
-    (lambda (args)
-      (if (nullp args)
-          "1"
-          (format nil "(~{~A~^ * ~})" (expand-args args)))))
+(define-expr-op 'cl:* (args)
+  (if (nullp args)
+      "1"
+      (format nil "(~{~A~^ * ~})" (expand-args args))))
 
-(define-expr-op 'cl:/
-    (lambda (args)
-      (if (nullp args)
-          "1"
-          (if (= (length args) 1)
-              (format nil "(1/~A)" (car args))
-              (format nil "(~{~A~^ / ~})" (expand-args args))))))
+(define-expr-op 'cl:/ (args)
+  (if (nullp args)
+      "1"
+      (if (= (length args) 1)
+          (format nil "(1/~A)" (car args))
+          (format nil "(~{~A~^ / ~})" (expand-args args)))))
 
-(define-expr-op 'cl:or
-    (lambda (args)
-      (if (nullp args)
-          "false"
-          (format nil "(~{~A~^ || ~})" (expand-args args)))))
+(define-expr-op 'cl:or (args)
+  (if (nullp args)
+      "false"
+      (format nil "(~{~A~^ || ~})" (expand-args args))))
 
-(define-expr-op 'cl:and
-    (lambda (args)
-      (if (nullp args)
-          "true"
-          (format nil "(~{~A~^ && ~})" (expand-args args)))))
+(define-expr-op 'cl:and (args)
+  (if (nullp args)
+      "true"
+      (format nil "(~{~A~^ && ~})" (expand-args args))))
 
-(define-expr-op 'cl:not
-    (lambda (args)
-      (format nil "(!~A)" (car (expand-args args)))))
+(define-expr-op 'cl:not (args)
+  (format nil "(!~A)" (car (expand-args args))))
 
-(define-expr-op 'cl:=
-    (lambda (args)
-      (cond ((= (length args) 1) "true")
-            (t (format nil "(~{~A~^ == ~})" (expand-args args))))))
+(define-expr-op 'cl:= (args)
+  (cond ((= (length args) 1) "true")
+        (t (format nil "(~{~A~^ == ~})" (expand-args args)))))
 
 ;;; CONTROL OPERATORS
 
-(define-control-op 'cl:block
-    (lambda (args)
-      (destructuring-bind (name &rest args) args
-        (declare (ignore name))
-        (concatenate 'string
-                     (format nil "{~{~%~A~}"
-                             (mapcar (lambda (arg)
-                                       (ck-clle/string:indent (format nil "~A" arg) +indentation+))
-                                     (expand-args args)))
-                     (format nil "~%}")))))
+(define-control-op 'cl:block (args)
+  (destructuring-bind (name &rest args) args
+    (declare (ignore name))
+    (concatenate 'string
+                 (format nil "{~{~%~A~}"
+                         (mapcar (lambda (arg)
+                                   (ck-clle/string:indent (format nil "~A" arg) +indentation+))
+                                 (expand-args args)))
+                 (format nil "~%}"))))
 
-(define-control-op 'cl:if
-    (lambda (args)
-      (destructuring-bind (cond-expr then-expr &optional else-expr) args
-        (cond
-          ((and then-expr else-expr)
-           (format nil "if (~A) ~A~%else ~A"
-                   (let ((*is-toplevel-expression* nil))
-                     (transpile-form cond-expr))
-                   (funcall (op-func 'cl:block) (list nil then-expr))
-                   (funcall (op-func 'cl:block) (list nil else-expr))))
-          (then-expr
-           (format nil "if (~A) ~A"
-                   (let ((*is-toplevel-expression* nil))
-                     (transpile-form cond-expr))
-                   (funcall (op-func 'cl:block) (list nil then-expr))))))))
+(define-control-op 'cl:if (args)
+  (destructuring-bind (cond-expr then-expr &optional else-expr) args
+    (cond
+      ((and then-expr else-expr)
+       (format nil "if (~A) ~A~%else ~A"
+               (let ((*is-toplevel-expression* nil))
+                 (transpile-form cond-expr))
+               (funcall (op-func 'cl:block) (list nil then-expr))
+               (funcall (op-func 'cl:block) (list nil else-expr))))
+      (then-expr
+       (format nil "if (~A) ~A"
+               (let ((*is-toplevel-expression* nil))
+                 (transpile-form cond-expr))
+               (funcall (op-func 'cl:block) (list nil then-expr)))))))
 
-(define-control-op 'cl:progn
-    (lambda (args)
-      (destructuring-bind (&rest forms) args
-        (funcall (op-func 'cl:block) `(nil ,@forms)))))
+(define-control-op 'cl:progn (args)
+  (destructuring-bind (&rest forms) args
+    (funcall (op-func 'cl:block) `(nil ,@forms))))
 
-(define-control-op 'cl:when
-  (lambda (args)
-    (destructuring-bind (cond-expr &rest forms) args
-      (format nil "if (~A) ~A"
-              (let ((*is-toplevel-expression* nil))
-                (transpile-form cond-expr))
-              (funcall (op-func 'cl:block) `(nil ,@forms))))))
+(define-control-op 'cl:when (args)
+  (destructuring-bind (cond-expr &rest forms) args
+    (format nil "if (~A) ~A"
+            (let ((*is-toplevel-expression* nil))
+              (transpile-form cond-expr))
+            (funcall (op-func 'cl:block) `(nil ,@forms)))))
 
-(define-control-op 'cl:unless
-    (lambda (args)
-      (destructuring-bind (cond-expr &rest forms) args
-        (funcall (op-func 'cl:when) `((not ,cond-expr) ,@forms)))))
+(define-control-op 'cl:unless (args)
+  (destructuring-bind (cond-expr &rest forms) args
+    (funcall (op-func 'cl:when) `((not ,cond-expr) ,@forms))))
 
-(define-control-op 'cl:let
-  (lambda (args)
-    (destructuring-bind (bindings &rest body) args
+(define-control-op 'cl:let (args)
+  (destructuring-bind (bindings &rest body) args
+    (let ((cpp-bindings
+            (loop for binding in bindings
+                  collect (format nil "auto ~A = [~{~A~^, ~}]() ~A();"
+                                  (cpp-argnamicate (car binding))
+                                  (mapcar #'cpp-argnamicate *routine-args*)
+                                  (let ((*should-return-result* t))
+                                    (funcall (op-func 'cl:block)
+                                             `(nil ,(cadr binding))))))))
+      (format nil "~{~A~^~%~}~%~A"
+              cpp-bindings
+              (let ((*routine-args*
+                      (append *routine-args* (mapcar #'car bindings))))
+                (funcall (op-func 'cl:block) `(nil ,@body)))))))
+
+(define-control-op 'cl:let* (args)
+  (destructuring-bind (bindings &rest body) args
+    (let ((*routine-args* *routine-args*))
       (let ((cpp-bindings
               (loop for binding in bindings
                     collect (format nil "auto ~A = [~{~A~^, ~}]() ~A();"
@@ -389,7 +398,8 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                                     (mapcar #'cpp-argnamicate *routine-args*)
                                     (let ((*should-return-result* t))
                                       (funcall (op-func 'cl:block)
-                                               `(nil ,(cadr binding))))))))
+                                               `(nil ,(cadr binding)))))
+                    do (setf *routine-args* (push (car binding) *routine-args*)))))
         (format nil "~{~A~^~%~}~%~A"
                 cpp-bindings
                 (let ((*routine-args*
