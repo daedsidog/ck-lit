@@ -147,6 +147,9 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
        (format-expr form))
       ((listp form)
        (let ((car (car form)))
+         (when (ignored-op-symbol-p car)
+           (return-from transpile-form (format nil "/* Ignored operator: ~A */"
+                                               (verbose-symbol-name car))))
          (when (eqp car *entry-point-function-sym*)
            (error "Recursive call to main function ~A." car))
          (if-let ((op (op car)))
