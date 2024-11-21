@@ -10,7 +10,8 @@
 (defclass expression () ())
 
 (defclass routine (expression)
-  ((cpp-name  :initarg :cpp-name  :accessor routine-cpp-name)
+  ((name      :initarg :name      :accessor routine-name)
+   (cpp-name  :initarg :cpp-name  :accessor routine-cpp-name)
    (signature :initarg :signature :accessor routine-signature)
    (body      :initarg :body      :accessor routine-body :initform nil)))
 
@@ -23,13 +24,17 @@
       (numberp obj)
       (symbolp obj)))
 
-(defvar *routine-table* (make-hash-table))
 (defvar *op-table* (make-hash-table))
-(defvar *entry-point-function-sym* nil)
-(defvar *ignored-ops* (make-hash-table))
+(defvar *requirement-table* (make-hash-table))
+(defvar *ignored-ops-table* (make-hash-table))
 
 (defparameter +namespace-prefix+ "ck_lli_cpp")
 (defparameter +indentation+ "  ")
+
+(defvar *routine-table*)
+(defvar *requirement-inclusion-table*)
+(defvar *op-requirement-registration-table*)
+(defvar *entry-point-function-symbol*)
 
 (defun transpile (entry-point-function-symbol &optional (destination *standard-output*))
   "Transpile a Lisp function to a target language and save to a file or write to a stream.
@@ -42,9 +47,6 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
   ;; Check if ENTRY-POINT-FUNCTION-SYMBOL has an associated function.
   (let ((entry-point-function (symbol-function entry-point-function-symbol))
         lambda-list-len)
-    ;; This might be a bad idea down the road.  We should think of a way to reuse transpiled
-    ;; routines instead of re-transpiling everything every time.
-    (setf *routine-table* (make-hash-table))
     (when (nullp entry-point-function)
       (error "~A does not have an associated function." entry-point-function-symbol))
     ;; Check the number of parameters for the ENTRY-POINT-FUNCTION.
@@ -57,12 +59,28 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                 (and (stringp destination)
                      (probe-file (truename (merge-pathnames destination)))))
       (error "~A is not a valid file path or a stream." destination))
-    (let ((*entry-point-function-sym* entry-point-function-symbol))
+    (let ((*entry-point-function-symbol* entry-point-function-symbol)
+          ;; This might be a bad idea down the road.  We should think of a way to reuse transpiled
+          ;; routines instead of re-transpiling everything every time.
+          (*routine-table* (make-hash-table))
+          (*requirement-inclusion-table* (make-hash-table))
+          (*op-requirement-registration-table* (make-hash-table)))
+      ;; Transpile the program from its entry point.
       (transpile-routine entry-point-function-symbol)
-      ;; Write final transpiled program.
+      ;; Write final transpiled program.  Start with writing requirements, such as include files and
+      ;; other preamble.
+      (let ((have-requirements nil))
+        (maphash (lambda (req flag)
+                   (declare (ignore flag))
+                   (format destination "~&~A~%" (requirement-cpp req))
+                   (setf have-requirements t))
+                 *requirement-inclusion-table*)
+        (when have-requirements
+          (format destination "~%")))
+      ;; Write the transpiled routines under their own namespace definition.
       (with-output-to-string (namespace)
         (maphash (lambda (k routine)
-                   (unless (eqp k *entry-point-function-sym*)
+                   (unless (eqp k *entry-point-function-symbol*)
                      (format namespace "~A"
                              (ck-clle/string:indent
                               (format nil "~%~%~A {~%~A~%}"
@@ -74,14 +92,14 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
         (let ((ns-defs (get-output-stream-string namespace)))
           (unless (string-empty-p ns-defs)
             (format destination "~&namespace ~A {" +namespace-prefix+)
-            (write-string  ns-defs destination)
+            (write-string ns-defs destination)
             (format destination "~%}~%~%"))))
       (format destination "~&int main(~A) {~%"
               (if (zerop lambda-list-len)
                   ""
                   "int argc, char* argv[]"))
       (format destination "~A"
-              (ck-clle/string:indent (routine-body (routine *entry-point-function-sym*))
+              (ck-clle/string:indent (routine-body (routine *entry-point-function-symbol*))
                                      +indentation+))
       (format destination "~%}"))))
 
@@ -107,8 +125,8 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
 (defun cpp-identificate (input-string &optional (package-name ""))
   "Transform INPUT-STRING into a valid C++ identifier."
   (let* ((cleaned-string (cpp-alphanumericate input-string))
-         (gensym-number (gensym))
-         (result (format nil "~A_SUB_~A_~A"
+         (gensym-number (gensym "SUB"))
+         (result (format nil "~A_~A_~A"
                          (cpp-alphanumericate package-name)
                          gensym-number
                          cleaned-string)))
@@ -121,6 +139,7 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
 
 (defparameter *should-return-result* nil)
 (defparameter *is-toplevel-expression* t)
+(defparameter *routine* nil)
 (defparameter *routine-args* ())
 
 (defun cpp-argnamicate (arg-sym)
@@ -143,20 +162,21 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
        (if (memberp form *routine-args*)
            (format-expr (cpp-argnamicate form))
            (format-expr (cpp-alphanumericate form))))
-      ((numberp form)
-       (format-expr form))
+      ((stringp form) (format nil "~S" form))
+      ((numberp form) (format-expr form))
       ((listp form)
        (let ((car (car form)))
          (when (ignored-op-symbol-p car)
            (return-from transpile-form (format nil "/* Ignored operator: ~A */"
                                                (verbose-symbol-name car))))
-         (when (eqp car *entry-point-function-sym*)
+         (when (and (boundp '*entry-point-function-symbol*)
+                    (eqp car *entry-point-function-symbol*))
            (error "Recursive call to main function ~A." car))
          (if-let ((op (op car)))
            (if (expressionp op)
                (format-expr (let ((*is-toplevel-expression* nil))
-                              (funcall (op-lambda op) (cdr form))))
-               (format nil "~A" (funcall (op-lambda op) (cdr form))))
+                              (expand-op (op-symbol op) (cdr form))))
+               (format nil "~A" (expand-op (op-symbol op) (cdr form))))
            (let ((routine (routine car)))
              (if (nullp routine)
                  (let ((*should-return-result* t)
@@ -182,11 +202,13 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
 (defun transpile-routine (routine-sym)
   (unless (routinesquep routine-sym)
     (error "~A is not a valid routine symbol." routine-sym))
-  (let ((routine (or (routine routine-sym) (make-instance 'routine))))
+  (let* ((routine (or (routine routine-sym) (make-instance 'routine)))
+         (*routine* routine))
     (when (routine-body routine)
       (format t "~&; Overwriting routine ~A" (verbose-symbol-name routine-sym))
       (setf (routine-body routine) nil))
     (setf (gethash routine-sym *routine-table*) routine)
+    (setf (routine-name routine) routine-sym)
     (let* ((lambda-expr (function-lambda-expression (symbol-function routine-sym)))
            (arglist (cadr lambda-expr))
            (body (cddr lambda-expr))
@@ -225,19 +247,40 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
       (setf (routine-signature routine) signature)
       (format t "~&; Transpiled routine ~A~A"
               (verbose-symbol-name routine-sym)
-              (if (eqp routine-sym *entry-point-function-sym*) " (entry point)" ""))))
+              (if (and (boundp '*entry-point-function-symbol*)
+                       (eqp routine-sym *entry-point-function-symbol*))
+                  " (entry point)" ""))))
   (routine routine-sym))
+
+(defun expand-op (op-sym args)
+  (let ((op (op op-sym)))
+    (when (boundp '*entry-point-function-symbol*)
+      ;; Check if the operator has already been registered, which means that its requirements have
+      ;; already been satisfied.
+      (unless (gethash op *op-requirement-registration-table*)
+        (when-let ((requirements (op-requirements op)))
+          (loop for req in requirements
+                do (setf (gethash req *requirement-inclusion-table*) t)))
+        (setf (gethash op *op-requirement-registration-table*) t)))
+    (funcall (op-lambda op) args)))
 
 ;;; OPERATORS
 
 (defmacro expand-args (args)
-  `(mapcar #'transpile-form ,args))
+  `(loop for arg in ,args
+         for arg-idx from 0
+         with arg-count = (length ,args)
+         with expanded-args = ()
+         do (let ((*should-return-result* (= arg-idx (1- arg-count))))
+              (push (transpile-form arg) expanded-args))
+         finally (return (nreverse expanded-args))))
 
 (defclass op ()
   ((symbol           :initarg :symbol :accessor op-symbol :type symbol
                      :initform (error "Operation must be associated with a symbol."))
    (expansion-lambda :initarg :lambda :accessor op-lambda :type function
-                     :initform (error "Operation must be associated with an expansion lambda."))))
+                     :initform (error "Operation must be associated with an expansion lambda."))
+   (requirements     :initform nil    :accessor op-requirements)))
 
 (defmethod initialize-instance :after ((instance op) &key lambda &allow-other-keys)
   (unless (and (functionp lambda)
@@ -259,6 +302,34 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
           (op-symbol obj)))
 
 (defclass control-op (op) ())
+
+(defclass requirement ()
+  ((name :initarg :name :reader requirement-name)
+   (code :initarg :code :reader requirement-cpp)))
+
+(defmethod print-object ((obj requirement) stream)
+  (format stream "#<REQUIREMENT ~S>"
+          (requirement-name obj)))
+
+(defmacro define-requirement (name code)
+  `(let ((req (make-instance 'requirement
+                             :name ',name
+                             :code ,code)))
+     (when-let ((existing-req (gethash ',name *requirement-table*)))
+       (format t "~&; Overwriting ~A" existing-req))
+     (setf (gethash ',name *requirement-table*) req)
+     req))
+
+(defmacro define-dependencies (&body schema)
+  `(loop for (op-syms req-syms) in ',schema do
+    (loop for op-sym in op-syms do
+      (loop for req-sym in req-syms do
+        (let ((req (gethash req-sym *requirement-table*))
+              (op (op op-sym)))
+          (unless req
+            (error "~A does not exist in the requirement table." req-sym))
+          (pushnew req (op-requirements op))
+          (format nil "~&; ~A added as a requirement of ~A" req op))))))
 
 (defun control-op-p (op)
   (typep op 'control-op))
@@ -330,17 +401,42 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
   (cond ((= (length args) 1) "true")
         (t (format nil "(~{~A~^ == ~})" (expand-args args)))))
 
+(define-expr-op 'cl:princ (args)
+  (let ((stream (if (null (cdr args))
+                    "std::cout"
+                    (car (cdr args)))))
+    (format nil "~A << ~A" stream (car (expand-args args)))))
+
+(define-expr-op 'cl:terpri (args)
+  (let ((stream (if (null args)
+                    "std::cout"
+                    (car args))))
+    (format nil "~A << std::endl" stream)))
+
+;;; EXPRESSION OPERATOR DEPENDENCIES
+
+(define-requirement iostream
+  "#include <iostream>")
+
+(define-dependencies
+  ((cl:princ cl:terpri) (iostream)))
+
 ;;; CONTROL OPERATORS
+
+(define-control-op 'cl:progn (args)
+  (concatenate 'string
+               (format nil "{~{~%~A~}"
+                       (mapcar (lambda (arg)
+                                 (ck-clle/string:indent (format nil "~A" arg) +indentation+))
+                               (expand-args args)))
+               (format nil "~%}")))
 
 (define-control-op 'cl:block (args)
   (destructuring-bind (name &rest args) args
     (declare (ignore name))
-    (concatenate 'string
-                 (format nil "{~{~%~A~}"
-                         (mapcar (lambda (arg)
-                                   (ck-clle/string:indent (format nil "~A" arg) +indentation+))
-                                 (expand-args args)))
-                 (format nil "~%}"))))
+    ;; TODO: This is clearly not how CL:BLOCK works, but it's what we use for now in order to have
+    ;; primitive functionality.
+    (expand-op 'cl:progn args)))
 
 (define-control-op 'cl:if (args)
   (destructuring-bind (cond-expr then-expr &optional else-expr) args
@@ -349,28 +445,24 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
        (format nil "if (~A) ~A~%else ~A"
                (let ((*is-toplevel-expression* nil))
                  (transpile-form cond-expr))
-               (funcall (op-func 'cl:block) (list nil then-expr))
-               (funcall (op-func 'cl:block) (list nil else-expr))))
+               (expand-op 'cl:progn (list then-expr))
+               (expand-op 'cl:progn (list else-expr))))
       (then-expr
        (format nil "if (~A) ~A"
                (let ((*is-toplevel-expression* nil))
                  (transpile-form cond-expr))
-               (funcall (op-func 'cl:block) (list nil then-expr)))))))
-
-(define-control-op 'cl:progn (args)
-  (destructuring-bind (&rest forms) args
-    (funcall (op-func 'cl:block) `(nil ,@forms))))
+               (expand-op 'cl:progn (list then-expr)))))))
 
 (define-control-op 'cl:when (args)
   (destructuring-bind (cond-expr &rest forms) args
     (format nil "if (~A) ~A"
             (let ((*is-toplevel-expression* nil))
               (transpile-form cond-expr))
-            (funcall (op-func 'cl:block) `(nil ,@forms)))))
+            (expand-op 'cl:progn forms))))
 
 (define-control-op 'cl:unless (args)
   (destructuring-bind (cond-expr &rest forms) args
-    (funcall (op-func 'cl:when) `((not ,cond-expr) ,@forms))))
+    (expand-op 'cl:when `((not ,cond-expr) ,@forms))))
 
 (define-control-op 'cl:let (args)
   (destructuring-bind (bindings &rest body) args
@@ -380,13 +472,12 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                                   (cpp-argnamicate (car binding))
                                   (mapcar #'cpp-argnamicate *routine-args*)
                                   (let ((*should-return-result* t))
-                                    (funcall (op-func 'cl:block)
-                                             `(nil ,(cadr binding))))))))
+                                    (expand-op 'cl:progn (cadr binding)))))))
       (format nil "~{~A~^~%~}~%~A"
               cpp-bindings
               (let ((*routine-args*
                       (append *routine-args* (mapcar #'car bindings))))
-                (funcall (op-func 'cl:block) `(nil ,@body)))))))
+                (expand-op 'cl:progn body))))))
 
 (define-control-op 'cl:let* (args)
   (destructuring-bind (bindings &rest body) args
@@ -397,24 +488,23 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                                     (cpp-argnamicate (car binding))
                                     (mapcar #'cpp-argnamicate *routine-args*)
                                     (let ((*should-return-result* t))
-                                      (funcall (op-func 'cl:block)
-                                               `(nil ,(cadr binding)))))
+                                      (expand-op 'cl:progn (cadr binding))))
                     do (setf *routine-args* (push (car binding) *routine-args*)))))
         (format nil "~{~A~^~%~}~%~A"
                 cpp-bindings
                 (let ((*routine-args*
                         (append *routine-args* (mapcar #'car bindings))))
-                  (funcall (op-func 'cl:block) `(nil ,@body))))))))
+                  (expand-op 'cl:progn body)))))))
 
 ;;; IGNORED OPERATORS
 
 (defmacro ignore-op-symbols (&rest op-syms)
   `(progn
      ,@(mapcar (lambda (op-sym)
-                 `(setf (gethash ',op-sym *ignored-ops*) t))
+                 `(setf (gethash ',op-sym *ignored-ops-table*) t))
                op-syms)))
 
 (defun ignored-op-symbol-p (op-sym)
-  (gethash op-sym *ignored-ops*))
+  (gethash op-sym *ignored-ops-table*))
 
 (ignore-op-symbols cl:declare)
