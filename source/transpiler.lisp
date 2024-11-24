@@ -260,9 +260,34 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
       (unless (gethash op *op-requirement-registration-table*)
         (when-let ((requirements (op-requirements op)))
           (loop for req in requirements
-                do (setf (gethash req *requirement-inclusion-table*) t)))
+                do (unless (gethash req *requirement-inclusion-table*)
+                     (setf (gethash req *requirement-inclusion-table*) t)
+                     (format t "~&; ~A requested by ~A" req op))))
         (setf (gethash op *op-requirement-registration-table*) t)))
-    (funcall (op-lambda op) args)))
+    ;; Lisp doesn't have a distinction between control operators and expression operators like most
+    ;; languages do, and so in Lisp we can arbitrarily compose forms as we please.
+    ;;
+    ;; For example, in Lisp we can do
+    ;;
+    ;;   (+ 1 (IF (PREDP 1) 2 3)) ; Lisp code
+    ;;
+    ;; which is a valid expression, but we cannot do the same in C++ unless we use the tertiary
+    ;; assignment syntax, e.g.:
+    ;;
+    ;;   (1 + pred()? 2 : 3) // C++ code
+    ;;
+    ;; Even with the tertiary syntax, we are still limited to expressions inside it.  We cannot, for
+    ;; example, run loops or other constructs.
+    ;;
+    ;; The solution is to use C++11 lambdas to compose these type of programs.
+    (if (and (control-op-p op)
+             (not *is-toplevel-expression*))
+        (format nil "~%[~{~A~^, ~}]() ~A()"
+                (mapcar #'cpp-argnamicate *routine-args*)
+                (let ((*should-return-result* t)
+                      (*is-toplevel-expression* t))
+                  (expand-op 'cl:progn `((,op-sym ,@args)))))
+        (funcall (op-lambda op) args))))
 
 ;;; OPERATORS
 
@@ -401,17 +426,29 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
   (cond ((= (length args) 1) "true")
         (t (format nil "(~{~A~^ == ~})" (expand-args args)))))
 
+(defun cpp-lambdicate (expression)
+  (format nil "[~{~A~^, ~}]() {~%~A~%}()"
+          (mapcar #'cpp-argnamicate *routine-args*)
+          (ck-clle/string:indent expression +indentation+)))
+
 (define-expr-op 'cl:princ (args)
   (let ((stream (if (null (cdr args))
                     "std::cout"
-                    (car (cdr args)))))
-    (format nil "~A << ~A" stream (car (expand-args args)))))
+                    (car (cdr args))))
+        (expr-name (cpp-argnamicate (gensym)))
+        (expr (car (expand-args args))))
+    (cpp-lambdicate (format nil "auto ~A = ~A;~%~A << ~A;~%return ~A;"
+                            expr-name
+                            expr
+                            stream
+                            expr-name
+                            expr-name))))
 
 (define-expr-op 'cl:terpri (args)
   (let ((stream (if (null args)
                     "std::cout"
                     (car args))))
-    (format nil "~A << std::endl" stream)))
+    (cpp-lambdicate (format nil "~A << std::endl;~%return nullptr;" stream))))
 
 ;;; EXPRESSION OPERATOR DEPENDENCIES
 
@@ -432,11 +469,14 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                (format nil "~%}")))
 
 (define-control-op 'cl:block (args)
-  (destructuring-bind (name &rest args) args
-    (declare (ignore name))
+  (destructuring-bind (name &rest rest-args) args
     ;; TODO: This is clearly not how CL:BLOCK works, but it's what we use for now in order to have
     ;; primitive functionality.
-    (expand-op 'cl:progn args)))
+    (if (and *routine*
+             (eqp (routine-name *routine*) name))
+        (format nil "~{~A~^~%~}"
+                  (expand-args rest-args))
+        (expand-op 'cl:progn rest-args))))
 
 (define-control-op 'cl:if (args)
   (destructuring-bind (cond-expr then-expr &optional else-expr) args
@@ -464,22 +504,9 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
   (destructuring-bind (cond-expr &rest forms) args
     (expand-op 'cl:when `((not ,cond-expr) ,@forms))))
 
-(define-control-op 'cl:let (args)
-  (destructuring-bind (bindings &rest body) args
-    (let ((cpp-bindings
-            (loop for binding in bindings
-                  collect (format nil "auto ~A = [~{~A~^, ~}]() ~A();"
-                                  (cpp-argnamicate (car binding))
-                                  (mapcar #'cpp-argnamicate *routine-args*)
-                                  (let ((*should-return-result* t))
-                                    (expand-op 'cl:progn (cadr binding)))))))
-      (format nil "~{~A~^~%~}~%~A"
-              cpp-bindings
-              (let ((*routine-args*
-                      (append *routine-args* (mapcar #'car bindings))))
-                (expand-op 'cl:progn body))))))
+(defvar *capture-previous-bindings* nil)
 
-(define-control-op 'cl:let* (args)
+(define-control-op 'cl:let (args)
   (destructuring-bind (bindings &rest body) args
     (let ((*routine-args* *routine-args*))
       (let ((cpp-bindings
@@ -488,13 +515,25 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                                     (cpp-argnamicate (car binding))
                                     (mapcar #'cpp-argnamicate *routine-args*)
                                     (let ((*should-return-result* t))
-                                      (expand-op 'cl:progn (cadr binding))))
-                    do (setf *routine-args* (push (car binding) *routine-args*)))))
-        (format nil "~{~A~^~%~}~%~A"
-                cpp-bindings
-                (let ((*routine-args*
-                        (append *routine-args* (mapcar #'car bindings))))
-                  (expand-op 'cl:progn body)))))))
+                                      (expand-op 'cl:progn `(,(cadr binding)))))
+                    when *capture-previous-bindings*
+                      do (setf *routine-args* (push (car binding) *routine-args*)))))
+        (concatenate 'string
+                     "{"
+                     (ck-clle/string:indent
+                      (concatenate 'string
+                                   (format nil "~{~%~A~}"
+                                           cpp-bindings)
+                                   (let ((*routine-args*
+                                           (append *routine-args* (mapcar #'car bindings))))
+                                     (format nil "~{~%~A~}"
+                                             (expand-args body))))
+                      +indentation+)
+                     (format nil "~%}"))))))
+
+(define-control-op 'cl:let* (args)
+  (let ((*capture-previous-bindings* t))
+    (expand-op 'cl:let args)))
 
 ;;; IGNORED OPERATORS
 
