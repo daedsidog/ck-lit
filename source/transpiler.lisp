@@ -424,7 +424,16 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
 
 (define-expr-op 'cl:= (args)
   (cond ((= (length args) 1) "true")
-        (t (format nil "(~{~A~^ == ~})" (expand-args args)))))
+        ((= (length args) 2)
+         (format nil "(~A == ~A)"
+                 (first (expand-args args))
+                 (second (expand-args args))))
+        (t (let ((arg-pairs (mapcar #'(lambda (a b)
+                                        (list a b))
+                                    (butlast args)
+                                    (cdr args))))
+             (format nil "(~{(~{~A == ~A~})~^ && ~})"
+                     arg-pairs)))))
 
 (defun cpp-lambdicate (expression)
   (format nil "[~{~A~^, ~}]() {~%~A~%}()"
