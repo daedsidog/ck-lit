@@ -422,19 +422,6 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
 (define-expr-op 'cl:not (args)
   (format nil "(!~A)" (car (expand-args args))))
 
-(define-expr-op 'cl:= (args)
-  (cond ((= (length args) 1) "true")
-        ((= (length args) 2)
-         (format nil "(~A == ~A)"
-                 (first (expand-args args))
-                 (second (expand-args args))))
-        (t (let ((arg-pairs (mapcar #'(lambda (a b)
-                                        (list a b))
-                                    (butlast args)
-                                    (cdr args))))
-             (format nil "(~{(~{~A == ~A~})~^ && ~})"
-                     arg-pairs)))))
-
 (defun cpp-lambdicate (expression)
   (format nil "[~{~A~^, ~}]() {~%~A~%}()"
           (mapcar #'cpp-argnamicate *routine-args*)
@@ -458,6 +445,46 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                     "std::cout"
                     (car args))))
     (cpp-lambdicate (format nil "~A << std::endl;~%return nullptr;" stream))))
+
+(defmacro cpp-comparison-expr (args cpp-operator &optional should-logical-or)
+  `(let ((expanded-args (expand-args ,args)))
+    (cond ((= (length expanded-args) 1) "true")
+          ((= (length expanded-args) 2) (format nil ,(format nil "~~A ~A ~~A" cpp-operator)
+                                                (first expanded-args)
+                                                (second expanded-args)))
+          (t 
+           (let ((argnames (loop for arg in expanded-args collect (cpp-argnamicate (gensym)))))
+             (cpp-lambdicate (concatenate 'string
+                                          (format nil "~{~{auto ~A = ~A;~%~}~}"
+                                                  (loop for argname in argnames
+                                                        for arg in expanded-args
+                                                        collect (list argname arg)))
+                                          (format nil
+                                                  ,(format
+                                                    nil
+                                                    "return (~~{(~~{~~A ~A ~~A~~})~~^ ~A ~~});"
+                                                    cpp-operator
+                                                    (if should-logical-or "||" "&&"))
+                                                  (loop for (n1 n2) on argnames
+                                                        when n2 collect (list n1 n2))))))))))
+
+(define-expr-op 'cl:= (args)
+  (cpp-comparison-expr args "=="))
+
+(define-expr-op 'cl:< (args)
+  (cpp-comparison-expr args "<"))
+
+(define-expr-op 'cl:> (args)
+  (cpp-comparison-expr args ">"))
+
+(define-expr-op 'cl:>= (args)
+  (cpp-comparison-expr args ">="))
+  
+(define-expr-op 'cl:<= (args)
+  (cpp-comparison-expr args "<="))
+
+(define-expr-op 'cl:/= (args)
+  (cpp-comparison-expr args "!=" t))
 
 ;;; EXPRESSION OPERATOR DEPENDENCIES
 
