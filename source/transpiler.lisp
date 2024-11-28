@@ -486,6 +486,27 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
 (define-expr-op 'cl:/= (args)
   (cpp-comparison-expr args "!=" t))
 
+(define-expr-op 'cl:setq (args)
+  (if (eqp (length args) 2)
+      (format nil "~A = ~A"
+              (cpp-argnamicate (car args))
+              (transpile-form (cadr args)))
+      (let ((assignments (loop for (first second) on args by #'cddr
+                               collect (cons first second))))
+        (cpp-lambdicate (concatenate 'string
+                                     (format nil "~{~A;~%~}"
+                                             (mapcar (lambda (arg-pair)
+                                                       (format nil "~A = ~A"
+                                                               (cpp-argnamicate (car arg-pair))
+                                                               (transpile-form (cdr arg-pair))))
+                                                     (butlast assignments)))
+                                     (let* ((last-elt (car (last assignments)))
+                                            (argname (car last-elt))
+                                            (argval (cdr last-elt)))
+                                     (format nil "return ~A = ~A;"
+                                             (cpp-argnamicate argname)
+                                             (transpile-form argval))))))))
+
 ;;; EXPRESSION OPERATOR DEPENDENCIES
 
 (define-requirement iostream
