@@ -507,6 +507,20 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                                              (cpp-argnamicate argname)
                                              (transpile-form argval))))))))
 
+(define-expr-op 'cl:read-byte (args)
+  (destructuring-bind (stream &optinoal eof-error-p eof-value) args
+    ;; TODO: Handle EOF-ERROR-P and EOF-VALUE
+    (declare (ignore eof-error-p eof-value))
+    (let ((instream (if (eqp stream *standard-input*)
+                        "std::cin"
+                        instream))
+          (argname (cpp-argnamicate (gensym))))
+      (cpp-lambdicate (format nil "char ~A;~%~A >> ~A;~%return ~A;"
+                              argname
+                              instream
+                              argname
+                              argname)))))
+
 ;;; EXPRESSION OPERATOR DEPENDENCIES
 
 (define-requirement iostream
