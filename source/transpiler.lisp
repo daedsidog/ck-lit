@@ -151,12 +151,14 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
 (defparameter *is-toplevel-expression* t)
 (defparameter *routine* nil)
 (defparameter *routine-args* ())
+(defparameter *tagbody-labels* ())
 
 (defun cpp-argnamicate (arg-sym)
   (format nil "ARG_~A" (cpp-alphanumericate (symbol-name arg-sym))))
 
 (defun transpile-form (form)
   "Return a string corresponding to C++ code equivalent to the Lisp FORM."
+  (format t "~&; Transpiling form ~A with SRR = ~A" form *should-return-result*)
   (labels ((format-expr (expr)
              (format nil "~A~A~A"
                      (if (and *should-return-result*
@@ -308,7 +310,10 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
          for arg-idx from 0
          with arg-count = (length ,args)
          with expanded-args = ()
-         do (let ((*should-return-result* (= arg-idx (1- arg-count))))
+         do (let ((*should-return-result*
+                    (if (nullp *should-return-result*)
+                        nil
+                        (= arg-idx (1- arg-count)))))
               (push (transpile-form arg) expanded-args))
          finally (return (nreverse expanded-args))))
 
@@ -547,25 +552,80 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
     (format nil "~A::cons(~A, ~A)"
             +namespace-prefix+
             se1
-            se2)))  
+            se2)))
+
+(define-expr-op 'cl:byte (args)
+  (destructuring-bind (size position) args
+    (transpile-form `(cons ,size ,position))))
+
+(define-expr-op 'cl:car (args)
+  (format nil "~A.car" (car (expand-args args))))
+
+(define-expr-op 'cl:cdr (args)
+  (format nil "~A.cdr" (car (expand-args args))))
+
+(define-expr-op 'cl:ldb (args)
+  (destructuring-bind (bytespec integer) (expand-args args)
+    (cpp-lambdicate
+     (concatenate 'string
+                  (format nil "auto cons = ~A;~%"
+                          bytespec)
+                  (format nil "return (~A >> cons.cdr) % cons.car;~%"
+                          integer)))))
+
+(define-expr-op 'cl:go (args)
+  (let ((label (car args)))
+    (loop for (lisp-label . cpp-label-name) in *tagbody-labels*
+          when (eqp label lisp-label)
+            do (return (format nil "goto ~A" cpp-label-name)))))
 
 ;;; EXPRESSION OPERATOR DEPENDENCIES
 
-(define-requirement include iostream
-  "#include <iostream>")
+(define-requirement include ostream
+  "#include <ostream>")
 
-(define-requirement namespace cons-struct
+(define-requirement include istream
+  "#include <istream>")
+
+(define-requirement namespace cons-cell-struct
   "template <typename T, typename V>
 struct cons {
   T car;
-  V cdr = nullptr;
-  cons(T car) : car(car) {}
+  V cdr;
+  cons(T car) : car(car), cdr(nullptr) {}
   cons(T car, V cdr) : car(car), cdr(cdr) {}
-};")
+};
+
+template<typename T, typename V>
+std::ostream& operator<<(std::ostream& os, const cons<T, V>& c) {
+  os << \"(\" << c.car;
+  auto current = &c.cdr;
+  while (true) {
+      if (current == nullptr) {
+        break;
+      }
+      else if (auto next_cons = dynamic_cast<const cons<typename V::car_type,
+                                                        typename V::cdr_type>*>(current)) {
+        os << \" \" << next_cons->car;
+        current = &next_cons->cdr;
+      }
+      else {
+        os << \" . \" << *current;
+        break;
+      }
+  }
+  os << \")\";
+  return os;
+}
+
+std::ostream& operator<<(std::ostream& os, std::nullptr_t) {
+  return os << \"NIL\";
+}")
 
 (define-dependencies
-  ((cl:princ cl:terpri) (iostream))
-  ((cl:cons) (cons-struct)))
+  ((cl:princ cl:terpri) (ostream))
+  ((cl:cons) (cons-cell-struct ostream))
+  ((cl:read-byte) (istream)))
 
 ;;; CONTROL OPERATORS
 
@@ -643,6 +703,25 @@ struct cons {
 (define-control-op 'cl:let* (args)
   (let ((*capture-previous-bindings* t))
     (expand-op 'cl:let args)))
+
+(define-control-op 'cl:tagbody (args)
+  (let ((*tagbody-labels* *tagbody-labels*)
+        (*should-return-result* nil)
+        (result ""))
+    (loop for form in args
+          if (not (listp form))
+            do (let ((label-name
+                       (format nil "LABEL_~A"
+                               (cpp-alphanumericate (symbol-name (gensym (symbol-name form)))))))
+                 (push (cons form label-name) *tagbody-labels*)
+                 (setf result (format nil "~A~&~A:"
+                                      result
+                                      label-name)))
+          else do
+            (setf result (format nil "~A~&~A"
+                                 result
+                                 (transpile-form form))))
+    result))
 
 ;;; IGNORED OPERATORS
 
