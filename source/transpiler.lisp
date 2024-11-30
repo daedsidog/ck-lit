@@ -408,6 +408,11 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
 
 ;;; EXPRESSION OPERATORS
 
+(defun cpp-lambdicate (expression)
+  (format nil "[~{~A~^, ~}]() {~%~A~%}()"
+          (mapcar #'cpp-argnamicate *routine-args*)
+          (ck-clle/string:indent expression +indentation+)))
+
 (define-expr-op 'cl:+ (args)
   (if (nullp args)
       "0"
@@ -443,12 +448,7 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
       (format nil "(~{~A~^ && ~})" (expand-args args))))
 
 (define-expr-op 'cl:not (args)
-  (format nil "(!~A)" (car (expand-args args))))
-
-(defun cpp-lambdicate (expression)
-  (format nil "[~{~A~^, ~}]() {~%~A~%}()"
-          (mapcar #'cpp-argnamicate *routine-args*)
-          (ck-clle/string:indent expression +indentation+)))
+  (format nil "!(~A)" (car (expand-args args))))
 
 (define-expr-op 'cl:princ (args)
   (let ((stream (if (null (cdr args))
