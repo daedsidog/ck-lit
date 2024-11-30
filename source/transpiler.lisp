@@ -67,18 +67,28 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
           (*op-requirement-registration-table* (make-hash-table)))
       ;; Transpile the program from its entry point.
       (transpile-routine entry-point-function-symbol)
-      ;; Write final transpiled program.  Start with writing requirements, such as include files and
-      ;; other preamble.
-      (let ((have-requirements nil))
+      ;; Write final transpiled program.  Start with writing the include requirements, such as
+      ;; include files and other preamble that should go before the namespace.
+      (let ((have-include-requirements nil))
         (maphash (lambda (req flag)
                    (declare (ignore flag))
-                   (format destination "~&~A~%" (requirement-cpp req))
-                   (setf have-requirements t))
+                   (when (typep req 'include-requirement)
+                     (format destination "~&~A~%" (requirement-cpp req))
+                     (setf have-include-requirements t)))
                  *requirement-inclusion-table*)
-        (when have-requirements
+        (when have-include-requirements
           (format destination "~%")))
-      ;; Write the transpiled routines under their own namespace definition.
       (with-output-to-string (namespace)
+        ;; Write preamble code that should be part of the namespace, such as various structs and
+        ;; other constant data.
+        (maphash (lambda (req flag)
+                   (declare (ignore flag))
+                   (when (typep req 'namespace-requirement)
+                     (princ (ck-clle/string:indent (format nil "~%~%~A" (requirement-cpp req))
+                                                   +indentation+)
+                            namespace)))
+                 *requirement-inclusion-table*)
+        ;; Write the transpiled routines under their own namespace definition.
         (maphash (lambda (k routine)
                    (unless (eqp k *entry-point-function-symbol*)
                      (format namespace "~A"
@@ -159,9 +169,11 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                          ""))))
     (cond
       ((symbolp form)
-       (if (memberp form *routine-args*)
-           (format-expr (cpp-argnamicate form))
-           (format-expr (cpp-alphanumericate form))))
+       (if (eqp form nil)
+           "nullptr"
+           (if (memberp form *routine-args*)
+               (format-expr (cpp-argnamicate form))
+               (format-expr (cpp-alphanumericate form)))))
       ((stringp form) (format nil "~S" form))
       ((numberp form) (format-expr form))
       ((listp form)
@@ -332,12 +344,18 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
   ((name :initarg :name :reader requirement-name)
    (code :initarg :code :reader requirement-cpp)))
 
+(defclass include-requirement (requirement) ())
+
+(defclass namespace-requirement (requirement) ())
+
 (defmethod print-object ((obj requirement) stream)
   (format stream "#<REQUIREMENT ~S>"
           (requirement-name obj)))
 
-(defmacro define-requirement (name code)
-  `(let ((req (make-instance 'requirement
+(defmacro define-requirement (requirement-type name code)
+  `(let ((req (make-instance ',(if (eqp requirement-type 'include)
+                                   'include-requirement
+                                   'namespace-requirement)
                              :name ',name
                              :code ,code)))
      (when-let ((existing-req (gethash ',name *requirement-table*)))
@@ -486,6 +504,9 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
 (define-expr-op 'cl:/= (args)
   (cpp-comparison-expr args "!=" t))
 
+(define-expr-op 'cl:zerop (args)
+  (transpile-form `(= 0 ,(car args))))
+
 (define-expr-op 'cl:setq (args)
   (if (eqp (length args) 2)
       (format nil "~A = ~A"
@@ -521,13 +542,30 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                               argname
                               argname)))))
 
+(define-expr-op 'cl:cons (args)
+  (destructuring-bind (se1 se2) (expand-args args)
+    (format nil "~A::cons(~A, ~A)"
+            +namespace-prefix+
+            se1
+            se2)))  
+
 ;;; EXPRESSION OPERATOR DEPENDENCIES
 
-(define-requirement iostream
+(define-requirement include iostream
   "#include <iostream>")
 
+(define-requirement namespace cons-struct
+  "template <typename T, typename V>
+struct cons {
+  T car;
+  V cdr = nullptr;
+  cons(T car) : car(car) {}
+  cons(T car, V cdr) : car(car), cdr(cdr) {}
+};")
+
 (define-dependencies
-  ((cl:princ cl:terpri) (iostream)))
+  ((cl:princ cl:terpri) (iostream))
+  ((cl:cons) (cons-struct)))
 
 ;;; CONTROL OPERATORS
 
