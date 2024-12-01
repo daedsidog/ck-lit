@@ -570,7 +570,8 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
                         "std::cin"
                         stream))
           (argname (cpp-argnamicate (gensym))))
-      (cpp-lambdicate (format nil "char ~A;~%~A >> ~A;~%return ~A;"
+      (cpp-lambdicate (format nil "char ~A = ~A.get();
+return ~A == std::char_traits<char>::eof()? 0 : ~A;"
                               argname
                               instream
                               argname
@@ -599,7 +600,7 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
      (concatenate 'string
                   (format nil "auto cons = ~A;~%"
                           bytespec)
-                  (format nil "return (~A >> cons.cdr) % cons.car;~%"
+                  (format nil "return (~A >> cons.cdr) & ((1 << cons.car) -1);~%"
                           integer)))))
 
 (define-expr-op 'cl:go (args)
