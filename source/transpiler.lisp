@@ -43,8 +43,8 @@
 The ENTRY-POINT-FUNCTION-SYMBOL parameter should be a symbol associated with a Lisp function that
 takes either two arguments, corresponding to C argc and argv arguments, or no arguments at all.
 
-The DESTINATION parameter specifies either a
-stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code will be saved."
+The DESTINATION parameter specifies either a stream (defaults to *STANDARD-OUTPUT*) or a file path
+where the transpiled code will be saved."
   ;; Check if ENTRY-POINT-FUNCTION-SYMBOL has an associated function.
   (let ((entry-point-function (symbol-function entry-point-function-symbol))
         lambda-list-len)
@@ -292,10 +292,12 @@ stream (defaults to *STANDARD-OUTPUT*) or a file path where the transpiled code 
        ;; The first case we want to examine is if the current form is a specific symbol.  The NIL
        ;; symbol transpiles as C++ nullptr.
        (if (eqp form nil)
-           (format-expr "nullptr")
-           (if (memberp form *routine-args*)
-               (format-expr (cpp-argnamicate form))
-               (format-expr (cpp-alphanumericate form)))))
+           (format-expr "0")
+           (if (eqp form t)
+               (format-expr "1")
+               (if (memberp form *routine-args*)
+                   (format-expr (cpp-argnamicate form))
+                   (format-expr (cpp-alphanumericate form))))))
       ((stringp form)
        ;; Check if it is a string.  Strings are transpiled as-is.
        (format nil "~S" form))
