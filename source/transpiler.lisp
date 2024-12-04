@@ -17,25 +17,19 @@
 
 (defmethod print-object ((obj routine) stream)
   (format stream "#<ROUTINE ~A>"
-          (routine-cpp-name obj)))
-
-(defun expressionp (obj)
-  (or (typep obj 'expression)
-      (numberp obj)
-      (symbolp obj)))
+          (routine-name obj)))
 
 (defvar *op-table* (make-hash-table))
 (defvar *requirement-table* (make-hash-table))
-(defvar *ignored-ops-table* (make-hash-table))
-(defvar *alias-table* (make-hash-table))
 
 (defparameter +namespace-prefix+ "ck_lli_cpp")
 (defparameter +indentation+ "  ")
+(defparameter +cpp-nil+ "0")
 
-(defvar *routine-table*)
-(defvar *requirement-inclusion-table*)
-(defvar *op-requirement-registration-table*)
-(defvar *entry-point-function-symbol*)
+(defvar *routine-table* (make-hash-table))
+(defvar *requirement-inclusion-table* (make-hash-table))
+(defvar *op-requirement-registration-table* (make-hash-table))
+(defvar *entry-point-function-symbol* nil)
 
 (defun transpile (entry-point-function-symbol &optional (destination *standard-output*))
   "Transpile a Lisp function to a target language and save to a file or write to a stream.
@@ -124,9 +118,6 @@ where the transpiled code will be saved."
               (functionp routine-func)
               (function-lambda-expression routine-func)))))
 
-(defun alias (sym)
-  (gethash sym *alias-table*))
-
 (defun cpp-alphanumericate (input-string)
   "Prune INPUT-STRING to keep only the alphanumeric portion and replace hyphens with underscores."
   (let ((result (map 'list (lambda (char)
@@ -151,31 +142,27 @@ where the transpiled code will be saved."
           sym
           (package-name (symbol-package sym))))
 
-(defparameter *should-return-result* nil)
-(defparameter *is-toplevel-expression* t)
 (defparameter *routine* nil)
 (defparameter *routine-args* ())
 (defparameter *tagbody-labels* ())
 
+(defmacro transpile-forms (forms)
+  `(mapcar #'transpile-form ,forms))
+
 (defun cpp-argnamicate (arg-sym)
   (format nil "ARG_~A" (cpp-alphanumericate (symbol-name arg-sym))))
 
-(defun cpp-lambdicate (expression)
-  (format nil "[~{&~A~^, ~}]() {~%~A~%}()"
-          (mapcar #'cpp-argnamicate *routine-args*)
-          (ck-clle/string:indent expression +indentation+)))
-
-(defmacro expand-args (args)
-  `(loop for arg in ,args
-         for arg-idx from 0
-         with arg-count = (length ,args)
-         with expanded-args = ()
-         do (let ((*should-return-result*
-                    (if (nullp *should-return-result*)
-                        nil
-                        (= arg-idx (1- arg-count)))))
-              (push (transpile-form arg) expanded-args))
-         finally (return (nreverse expanded-args))))
+(defun cpp-lambdicate (expression &optional bindings)
+  (let ((cpp-closure (format nil "[~{&~A~^, ~}]"
+                             (mapcar #'cpp-argnamicate *routine-args*)))
+        (cpp-arglist (format nil "(~{auto ~A~^, ~})"
+                             (mapcar #'cpp-argnamicate (mapcar #'car bindings))))
+        (args (mapcar #'cadr bindings)))
+    (format nil "~A~A {~%~A~%}(~{~A~^, ~})"
+            cpp-closure
+            cpp-arglist
+            (ck-clle/string:indent expression +indentation+)
+            args)))
 
 (defclass op ()
   ((symbol           :initarg :symbol :accessor op-symbol :type symbol
@@ -191,19 +178,12 @@ where the transpiled code will be saved."
                  (= (length (cadr lambda-sig)) 1)))
     (error "~A is not a lambda expression with exactly one argument" lambda)))
 
-(defclass expression-op (expression op) ())
-
 (defun op (op-sym)
   (gethash op-sym *op-table*))
 
-(defun expression-op-p (obj)
-  (typep obj 'expression-op))
-
-(defmethod print-object ((obj expression-op) stream)
-  (format stream "#<EXPRESSION-OP ~S>"
+(defmethod print-object ((obj op) stream)
+  (format stream "#<OP ~S>"
           (op-symbol obj)))
-
-(defclass control-op (op) ())
 
 (defclass requirement ()
   ((name :initarg :name :reader requirement-name)
@@ -239,13 +219,6 @@ where the transpiled code will be saved."
           (pushnew req (op-requirements op))
           (format nil "~&; ~A added as a requirement of ~A" req op))))))
 
-(defun control-op-p (op)
-  (typep op 'control-op))
-
-(defmethod print-object ((obj control-op) stream)
-  (format stream "#<CONTROL-OP ~S>"
-          (op-symbol obj)))
-
 (defun register-op (op)
   (when-let ((existing-op (gethash (op-symbol op) *op-table*)))
     (format t "~&; ~A overwritten with ~A" existing-op op))
@@ -254,103 +227,66 @@ where the transpiled code will be saved."
 (defun op-func (op-sym)
   (op-lambda (gethash op-sym *op-table*)))
 
-(defmacro define-op (type sym args-binding &body body)
-  `(register-op (make-instance ',type
+(defmacro define-op (sym args-binding &body body)
+  `(register-op (make-instance 'op
                                :symbol ,sym
                                :lambda (lambda ,args-binding
                                          ,@body))))
 
-(defmacro define-expr-op (sym args-binding &body body)
-  `(define-op expression-op ,sym ,args-binding ,@body))
-
-(defmacro define-control-op (sym args-binding &body body)
-  `(define-op control-op ,sym ,args-binding ,@body))
-
-(defmacro define-operator-alias (original target)
-  `(progn
-     (when (gethash ,original *alias-table*)
-       (format t "~&; ~A aliased as ~A"
-               (verbose-symbol-name ,original)
-               (verbose-symbol-name ,target)))
-       (setf (gethash ,original *alias-table*)
-             ,target)))
-
 (defun transpile-form (form)
   "Return a string corresponding to C++ code equivalent to the Lisp FORM."
-  (labels ((format-expr (expr)
-             (format nil "~A~A~A"
-                     (if (and *should-return-result*
-                              *is-toplevel-expression*)
-                         "return "
-                         "")
-                     expr
-                     (if *is-toplevel-expression*
-                         ";"
-                         ""))))
-    (cond
-      ((symbolp form)
-       ;; The first case we want to examine is if the current form is a specific symbol.  The NIL
-       ;; symbol transpiles as C++ nullptr.
-       (if (eqp form nil)
-           (format-expr "0")
-           (if (eqp form t)
-               (format-expr "1")
-               (if (memberp form *routine-args*)
-                   (format-expr (cpp-argnamicate form))
-                   (format-expr (cpp-alphanumericate form))))))
-      ((stringp form)
-       ;; Check if it is a string.  Strings are transpiled as-is.
-       (format nil "~S" form))
-      ((numberp form)
-       ;; Check if the form is a number.  Usually, numbers should also transpile as-is.  At the
-       ;; moment, we do not handle the entire CL numerical tower.
-       (format-expr form))
-      ((listp form)
-       ;; Check if the form is a list.  This is where it gets interesting, because lists will also
-       ;; contain functions and macros.
-       ;;
-       ;; We handle 3 things here:
-       ;;   1. Operator calls: calls that are not defined by usercode, and we have to provide their
-       ;;      implementation.
-       ;;   2. Routine calls: functions defined by usercode, for which we have to just invoke.
-       ;;   3. Macro calls: calls which we have to macroexpand and process.
-       (let ((car (car form)))
-         (when-let ((alias (alias car)))
-           (return-from transpile-form (transpile-form `(,alias ,@(cdr form)))))
-         (when (ignored-op-symbol-p car)
-           (return-from transpile-form (format nil "/* Ignored operator ~A */"
-                                               (verbose-symbol-name car))))
-         (when (and (boundp '*entry-point-function-symbol*)
-                    (eqp car *entry-point-function-symbol*))
-           (error "Recursive call to main function ~A." car))
-         (if-let ((op (op car)))
-           (if (expressionp op)
-               (format-expr (let ((*is-toplevel-expression* nil))
-                              (expand-op (op-symbol op) (cdr form))))
-               (format nil "~A" (expand-op (op-symbol op) (cdr form))))
-           (if (macro-function car)
-               (transpile-form (macroexpand form))
-               (let ((routine (routine car)))
-                 (if (nullp routine)
-                     (let ((*should-return-result* t)
-                           (*is-toplevel-expression* t))
-                       (setf routine (transpile-routine car))))
-                 (labels ((routine-expansion (name args)
-                            (format-expr
-                             (format nil "~A::~A(~{~A~^, ~})"
-                                     +namespace-prefix+
-                                     name
-                                     (let ((*is-toplevel-expression* nil))
-                                       (mapcar #'transpile-form args))))))
-                   (if (routine-cpp-name routine)
-                       (routine-expansion (routine-cpp-name routine) (cdr form))
-                       (progn
-                         (if (routinesquep car)
-                             (progn
-                               (transpile-routine car)
-                               (routine-expansion (routine-cpp-name car) (cdr form)))
-                             (error "~A is not a symbol, routine, or supported operator."
-                                    car)))))))))))))
+  (cond
+    ((symbolp form)
+     ;; The first case we want to examine is if the current form is a specific symbol.  The NIL
+     ;; symbol transpiles as C++ nullptr.
+     (if (eqp form nil)
+         +cpp-nil+
+         (if (eqp form t)
+             "1"
+             (if (memberp form *routine-args*)
+                 (cpp-argnamicate form)
+                 (cpp-alphanumericate form)))))
+    ((stringp form)
+     ;; Check if it is a string.  Strings are transpiled as-is.
+     (format nil "~S" form))
+    ((numberp form)
+     ;; Check if the form is a number.  Usually, numbers should also transpile as-is.  At the
+     ;; moment, we do not handle the entire CL numerical tower.
+     (format nil "~A" form))
+    ((listp form)
+     ;; Check if the form is a list.  This is where it gets interesting, because lists will also
+     ;; contain functions and macros.
+     ;;
+     ;; We handle 3 things here:
+     ;;   1. Operator calls: calls that are not defined by usercode, and we have to provide their
+     ;;      implementation.
+     ;;   2. Routine calls: functions defined by usercode, for which we have to just invoke.
+     ;;   3. Macro calls: calls which we have to macroexpand and process.
+     (let ((car (car form)))
+       (when (and (boundp '*entry-point-function-symbol*)
+                  (eqp car *entry-point-function-symbol*))
+         (error "Recursive call to main function ~A." car))
+       (if-let ((op (op car)))
+         (format nil "~A" (expand-op (op-symbol op) (cdr form)))
+         (if (macro-function car)
+             (transpile-form (macroexpand form))
+             (let ((routine (routine car)))
+               (when (nullp routine)
+                 (setf routine (transpile-routine car)))
+               (labels ((routine-expansion (name args)
+                          (format nil "~A::~A(~{~A~^, ~})"
+                                  +namespace-prefix+
+                                  name
+                                  (mapcar #'transpile-form args))))
+                 (if (routine-cpp-name routine)
+                     (routine-expansion (routine-cpp-name routine) (cdr form))
+                     (progn
+                       (if (routinesquep car)
+                           (progn
+                             (transpile-routine car)
+                             (routine-expansion (routine-cpp-name car) (cdr form)))
+                           (error "~A is not a symbol, routine, or supported operator."
+                                  car))))))))))))
 
 (defun transpile-routine (routine-sym)
   (unless (routinesquep routine-sym)
@@ -364,22 +300,13 @@ where the transpiled code will be saved."
     (setf (routine-name routine) routine-sym)
     (let* ((lambda-expr (function-lambda-expression (symbol-function routine-sym)))
            (arglist (cadr lambda-expr))
+           (*routine-args* arglist)
            (body (cddr lambda-expr))
-           (transpiled-body ())
+           (transpiled-body (mapcar #'transpile-form body))
            (signature nil))
       (setf (routine-cpp-name routine)
             (cpp-identificate (symbol-name routine-sym)
                               (package-name (symbol-package routine-sym))))
-      (let ((last-form (last body))
-            (*routine-args* arglist))
-        (labels ((transpile-aux (body)
-                   (when body
-                     (if (eqp last-form body)
-                         (let ((*should-return-result* t))
-                           (push (transpile-form (car body)) transpiled-body))
-                         (push (transpile-form (car body)) transpiled-body))
-                     (transpile-aux (cdr body)))))
-          (transpile-aux body)))
       (let ((return-type (if transpiled-body
                              "auto"
                              "void")))
@@ -395,8 +322,11 @@ where the transpiled code will be saved."
                                                                idx (cpp-argnamicate arg)))
                                                      (iota (length arglist))
                                                      arglist)))))
-      (setf (routine-body routine)
-            (format nil "~{~A~^~%~}" (nreverse transpiled-body)))
+      (let ((transpiled-body (nreverse transpiled-body)))
+        (setf (routine-body routine)
+              (format nil "~{~A;~%~}return ~A;"
+                      (butlast transpiled-body)
+                      (car (last transpiled-body)))))
       (setf (routine-signature routine) signature)
       (format t "~&; Transpiled routine ~A~A"
               (verbose-symbol-name routine-sym)
@@ -417,76 +347,53 @@ where the transpiled code will be saved."
                      (setf (gethash req *requirement-inclusion-table*) t)
                      (format t "~&; ~A requested by ~A" req op))))
         (setf (gethash op *op-requirement-registration-table*) t)))
-    ;; Lisp doesn't have a distinction between control operators and expression operators like most
-    ;; languages do, and so in Lisp we can arbitrarily compose forms as we please.
-    ;;
-    ;; For example, in Lisp we can do
-    ;;
-    ;;   (+ 1 (IF (PREDP 1) 2 3)) ; Lisp code
-    ;;
-    ;; which is a valid expression, but we cannot do the same in C++ unless we use the tertiary
-    ;; assignment syntax, e.g.:
-    ;;
-    ;;   (1 + pred()? 2 : 3) // C++ code
-    ;;
-    ;; Even with the tertiary syntax, we are still limited to expressions inside it.  We cannot, for
-    ;; example, run loops or other constructs.
-    ;;
-    ;; The solution is to use C++11 lambdas to compose these type of programs.
-    (if (and (control-op-p op)
-             (not *is-toplevel-expression*))
-        (format nil "~%[~{&~A~^, ~}]() ~A()"
-                (mapcar #'cpp-argnamicate *routine-args*)
-                (let ((*should-return-result* t)
-                      (*is-toplevel-expression* t))
-                  (expand-op 'cl:progn `((,op-sym ,@args)))))
-        (funcall (op-lambda op) args))))
+    (funcall (op-lambda op) args)))
 
-;;; EXPRESSION OPERATORS
+;;; OPERATORS
 
-(define-expr-op 'cl:+ (args)
+(define-op 'cl:+ (args)
   (if (nullp args)
       "0"
-      (format nil "(~{~A~^ + ~})" (expand-args args))))
+      (format nil "(~{~A~^ + ~})" (transpile-forms args))))
 
-(define-expr-op 'cl:- (args)
+(define-op 'cl:- (args)
   (if (nullp args)
       "0"
       (if (= (length args) 1)
           (format nil "(-~A)" (car args))
-          (format nil "(~{~A~^ - ~})" (expand-args args)))))
+          (format nil "(~{~A~^ - ~})" (transpile-forms args)))))
 
-(define-expr-op 'cl:* (args)
+(define-op 'cl:* (args)
   (if (nullp args)
       "1"
-      (format nil "(~{~A~^ * ~})" (expand-args args))))
+      (format nil "(~{~A~^ * ~})" (transpile-forms args))))
 
-(define-expr-op 'cl:/ (args)
+(define-op 'cl:/ (args)
   (if (nullp args)
       "1"
       (if (= (length args) 1)
           (format nil "(1/~A)" (car args))
-          (format nil "(~{~A~^ / ~})" (expand-args args)))))
+          (format nil "(~{~A~^ / ~})" (transpile-forms args)))))
 
-(define-expr-op 'cl:or (args)
+(define-op 'cl:or (args)
   (if (nullp args)
       "false"
-      (format nil "(~{~A~^ || ~})" (expand-args args))))
+      (format nil "(~{~A~^ || ~})" (transpile-forms args))))
 
-(define-expr-op 'cl:and (args)
+(define-op 'cl:and (args)
   (if (nullp args)
       "true"
-      (format nil "(~{~A~^ && ~})" (expand-args args))))
+      (format nil "(~{~A~^ && ~})" (transpile-forms args))))
 
-(define-expr-op 'cl:not (args)
-  (format nil "!(~A)" (car (expand-args args))))
+(define-op 'cl:not (args)
+  (format nil "(!(~A))" (car (transpile-forms args))))
 
-(define-expr-op 'cl:princ (args)
+(define-op 'cl:princ (args)
   (let ((stream (if (null (cdr args))
                     "std::cout"
                     (car (cdr args))))
         (expr-name (cpp-argnamicate (gensym)))
-        (expr (car (expand-args args))))
+        (expr (car (transpile-forms args))))
     (cpp-lambdicate (format nil "auto ~A = ~A;~%~A << ~A;~%return ~A;"
                             expr-name
                             expr
@@ -494,14 +401,14 @@ where the transpiled code will be saved."
                             expr-name
                             expr-name))))
 
-(define-expr-op 'cl:terpri (args)
+(define-op 'cl:terpri (args)
   (let ((stream (if (null args)
                     "std::cout"
                     (car args))))
     (cpp-lambdicate (format nil "~A << std::endl;~%return nullptr;" stream))))
 
 (defmacro cpp-comparison-expr (args cpp-operator &optional should-logical-or)
-  `(let ((expanded-args (expand-args ,args)))
+  `(let ((expanded-args (transpile-forms ,args)))
     (cond ((= (length expanded-args) 1) "true")
           ((= (length expanded-args) 2) (format nil ,(format nil "~~A ~A ~~A" cpp-operator)
                                                 (first expanded-args)
@@ -522,28 +429,28 @@ where the transpiled code will be saved."
                                                   (loop for (n1 n2) on argnames
                                                         when n2 collect (list n1 n2))))))))))
 
-(define-expr-op 'cl:= (args)
+(define-op 'cl:= (args)
   (cpp-comparison-expr args "=="))
 
-(define-expr-op 'cl:< (args)
+(define-op 'cl:< (args)
   (cpp-comparison-expr args "<"))
 
-(define-expr-op 'cl:> (args)
+(define-op 'cl:> (args)
   (cpp-comparison-expr args ">"))
 
-(define-expr-op 'cl:>= (args)
+(define-op 'cl:>= (args)
   (cpp-comparison-expr args ">="))
   
-(define-expr-op 'cl:<= (args)
+(define-op 'cl:<= (args)
   (cpp-comparison-expr args "<="))
 
-(define-expr-op 'cl:/= (args)
+(define-op 'cl:/= (args)
   (cpp-comparison-expr args "!=" t))
 
-(define-expr-op 'cl:zerop (args)
+(define-op 'cl:zerop (args)
   (transpile-form `(= 0 ,(car args))))
 
-(define-expr-op 'cl:setq (args)
+(define-op 'cl:setq (args)
   (if (eqp (length args) 2)
       (format nil "~A = ~A"
               (cpp-argnamicate (car args))
@@ -564,7 +471,7 @@ where the transpiled code will be saved."
                                              (cpp-argnamicate argname)
                                              (transpile-form argval))))))))
 
-(define-expr-op 'cl:read-byte (args)
+(define-op 'cl:read-byte (args)
   (destructuring-bind (stream &optional eof-error-p eof-value) args
     ;; TODO: Handle EOF-ERROR-P and EOF-VALUE
     (declare (ignore eof-error-p eof-value))
@@ -579,25 +486,25 @@ return ~A == std::char_traits<char>::eof()? 0 : ~A;"
                               argname
                               argname)))))
 
-(define-expr-op 'cl:cons (args)
-  (destructuring-bind (se1 se2) (expand-args args)
+(define-op 'cl:cons (args)
+  (destructuring-bind (se1 se2) (transpile-forms args)
     (format nil "~A::cons(~A, ~A)"
             +namespace-prefix+
             se1
             se2)))
 
-(define-expr-op 'cl:byte (args)
+(define-op 'cl:byte (args)
   (destructuring-bind (size position) args
     (transpile-form `(cons ,size ,position))))
 
-(define-expr-op 'cl:car (args)
-  (format nil "~A.car" (car (expand-args args))))
+(define-op 'cl:car (args)
+  (format nil "~A.car" (car (transpile-forms args))))
 
-(define-expr-op 'cl:cdr (args)
-  (format nil "~A.cdr" (car (expand-args args))))
+(define-op 'cl:cdr (args)
+  (format nil "~A.cdr" (car (transpile-forms args))))
 
-(define-expr-op 'cl:ldb (args)
-  (destructuring-bind (bytespec integer) (expand-args args)
+(define-op 'cl:ldb (args)
+  (destructuring-bind (bytespec integer) (transpile-forms args)
     (cpp-lambdicate
      (concatenate 'string
                   (format nil "auto cons = ~A;~%"
@@ -605,26 +512,144 @@ return ~A == std::char_traits<char>::eof()? 0 : ~A;"
                   (format nil "return (~A >> cons.cdr) & ((1 << cons.car) -1);~%"
                           integer)))))
 
-(define-expr-op 'cl:go (args)
+(define-op 'cl:go (args)
   (let ((label (car args)))
     (loop for (lisp-label . cpp-label-name) in *tagbody-labels*
           when (eqp label lisp-label)
-            do (return (format nil "goto ~A" cpp-label-name)))))
+            do (return (cpp-lambdicate (format nil "throw ~A_ENUM;" cpp-label-name))))))
 
 ;; FIXME: Needs to handle the case of returning out of named blocks.
-(define-expr-op 'cl:return-from (args)
+(define-op 'cl:return-from (args)
   (destructuring-bind (block-name &optional value) args
     (if (nullp block-name)
         (if value
             (format nil "return ~A" (transpile-form value))
             "return"))))
 
-(define-expr-op 'cl:return (args)
+(define-op 'cl:return (args)
   (if (car args)
       (format nil "return ~A" (transpile-form (car args)))
       "return"))
 
-;;; EXPRESSION OPERATOR DEPENDENCIES
+(define-op 'cl:progn (args)
+  (cpp-lambdicate (format nil "~{~A;~%~}return ~A;"
+                          (transpile-forms (butlast args))
+                          (car (transpile-forms (last args))))))
+
+;; KLUDGE: This is not how CL:BLOCK works, but it's what we use for now in order to have primitive
+;; functionality.
+(define-op 'cl:block (args)
+  (destructuring-bind (name &rest rest-args) args
+    (declare (ignore name))
+          (transpile-form `(cl:progn ,@rest-args))))
+  
+(define-op 'cl:if (args)
+  (destructuring-bind (cond-expr then-expr &optional else-expr) args
+    (cond
+      ((and then-expr else-expr)
+       (cpp-lambdicate (format nil"return ~A? ~A : ~A;"
+                               (transpile-form cond-expr)
+                               (transpile-form then-expr)
+                               (transpile-form else-expr))))
+      (then-expr
+       (cpp-lambdicate (format nil "return ~A? ~A : ~A;"
+                               (transpile-form cond-expr)
+                               (transpile-form then-expr)
+                               +cpp-nil+))))))
+
+(define-op 'cl:when (args)
+  (destructuring-bind (cond-expr &rest forms) args
+    (transpile-form `(cl:if ,cond-expr (cl:progn ,@forms)))))
+
+(define-op 'cl:unless (args)
+  (destructuring-bind (cond-expr &rest forms) args
+    (transpile-form `(cl:if (cl:not ,cond-expr) (cl:progn ,@forms)))))
+
+(define-op 'cl:let (args)
+  (destructuring-bind (bindings &rest body) args
+    (cpp-lambdicate (format nil "~{~A;~%~}return ~A;"
+                            (let ((*routine-args* (append *routine-args* (mapcar #'car bindings))))
+                              (transpile-forms (butlast body)))
+                            (let ((*routine-args* (append *routine-args* (mapcar #'car bindings))))
+                              (transpile-form (car (last body)))))
+                    (mapcar (lambda (binding)
+                              (list (car binding) (transpile-form (cadr binding))))
+                            bindings))))
+
+(define-op 'cl:let* (args)
+  (destructuring-bind (bindings &rest body) args
+    (if (= (length bindings) 1)
+        (transpile-form `(cl:let ,bindings ,@body))
+        (transpile-form `(cl:let (,(car bindings))
+                           (cl:let* ,(cdr bindings)
+                             ,@body))))))
+
+(define-op 'cl:tagbody (args)
+  (let* ((*tagbody-labels* *tagbody-labels*)
+         (enum-name (cpp-alphanumericate (format nil "~A" (gensym "ENUM"))))
+         (result (format nil "enum ~A {" enum-name)))
+    (loop for form in args
+          when (not (listp form))
+            do (let ((label-name
+                       (format nil "LABEL_~A"
+                               (cpp-alphanumericate (symbol-name (gensym (symbol-name form)))))))
+                 (push (cons form label-name) *tagbody-labels*)
+                 (setf result (format nil "~A~&~A~A_ENUM,"
+                                      result
+                                      +indentation+
+                                      label-name))))
+    (setf result (format nil "~A~&};" result))
+    (let ((open nil))
+      (labels ((catch-block ()
+                 (let ((result (format nil "catch (~A label_enum) {" enum-name)))
+                   (when *tagbody-labels*
+                     (setf result (format nil "~A~%~Aif (label_enum == ~A) goto ~A;~%"
+                                          result
+                                          +indentation+
+                                          (format nil "~A_ENUM" (cdr (car *tagbody-labels*)))
+                                          (cdr (car *tagbody-labels*))))
+                     (setf result (format nil "~A~{~{~Aelse if (label_enum == ~A) goto ~A;~%~}~}"
+                                          result
+                                          (mapcar (lambda (label)
+                                                    (list +indentation+
+                                                          (format nil "~A_ENUM" (cdr label))
+                                                          (cdr label)))
+                                                  (cdr *tagbody-labels*)))))
+                   (setf result (format nil "~A}" result)))))
+        (loop for form in args
+              if (not (listp form))
+                do (setf result (format nil "~A~&~A~A:~%try {"
+                                        result
+                                        (if open
+                                            (format nil "}~%~A~%"
+                                                    (catch-block))
+                                            (progn
+                                              (setf open t)
+                                              ""))
+                                        (cdr (assoc form *tagbody-labels*))))
+              else do
+                (unless open
+                  (setf result (format nil "~A~&try {" result))
+                  (setf open t))
+                (setf result (format nil "~A~&~A;"
+                                     result
+                                     (ck-clle/string:indent (transpile-form form)
+                                                            +indentation+))))
+        (when open
+          (setf result (format nil "~A}~%~A"
+                               result
+                               (catch-block))))))
+    (setf result (format nil "~A~%return ~A;" result +cpp-nil+))
+    (cpp-lambdicate result)))
+
+(define-op 'cl:loop (args)
+  (transpile-form (macroexpand `(khazern-extrinsic:loop ,@args))))
+
+(define-op 'cl:declare (args)
+  (declare (ignore args))
+  "/* CL:DECLARE ignored */")
+
+;;; OPERATOR DEPENDENCIES
 
 (define-requirement include iostream
   "#include <iostream>")
@@ -664,123 +689,10 @@ std::ostream& operator<<(std::ostream& os, std::nullptr_t) {
   return os << \"NIL\";
 }")
 
+(define-requirement include exception
+  "#include <exception>")
+
 (define-dependencies
   ((cl:princ cl:terpri cl:read-byte) (iostream))
-  ((cl:cons) (cons-cell-struct iostream)))
-
-;;; CONTROL OPERATORS
-
-(define-control-op 'cl:progn (args)
-  (concatenate 'string
-               (format nil "{~{~%~A~}"
-                       (mapcar (lambda (arg)
-                                 (ck-clle/string:indent (format nil "~A" arg) +indentation+))
-                               (expand-args args)))
-               (format nil "~%}")))
-
-;; KLUDGE: This is not how CL:BLOCK works, but it's what we use for now in order to have primitive
-;; functionality.  Also, CL:BLOCK isn't really a control operator...
-(define-control-op 'cl:block (args)
-  (destructuring-bind (name &rest rest-args) args
-    (if (and *routine*
-             (eqp (routine-name *routine*) name))
-        (format nil "~{~A~^~%~}"
-                  (expand-args rest-args))
-        (format nil "~A;"
-                (cpp-lambdicate (format nil "~{~A~^~%~}"
-                                        (expand-args rest-args)))))))
-  
-(define-control-op 'cl:if (args)
-  (destructuring-bind (cond-expr then-expr &optional else-expr) args
-    (cond
-      ((and then-expr else-expr)
-       (format nil "if (~A) ~A~%else ~A"
-               (let ((*is-toplevel-expression* nil))
-                 (transpile-form cond-expr))
-               (expand-op 'cl:progn (list then-expr))
-               (expand-op 'cl:progn (list else-expr))))
-      (then-expr
-       (format nil "if (~A) ~A"
-               (let ((*is-toplevel-expression* nil))
-                 (transpile-form cond-expr))
-               (expand-op 'cl:progn (list then-expr)))))))
-
-(define-control-op 'cl:when (args)
-  (destructuring-bind (cond-expr &rest forms) args
-    (format nil "if (~A) ~A"
-            (let ((*is-toplevel-expression* nil))
-              (transpile-form cond-expr))
-            (expand-op 'cl:progn forms))))
-
-(define-control-op 'cl:unless (args)
-  (destructuring-bind (cond-expr &rest forms) args
-    (expand-op 'cl:when `((not ,cond-expr) ,@forms))))
-
-(defvar *capture-previous-bindings* nil)
-
-(define-control-op 'cl:let (args)
-  (destructuring-bind (bindings &rest body) args
-    (let ((*routine-args* *routine-args*))
-      (let ((cpp-bindings
-              (loop for binding in bindings
-                    collect (format nil "auto ~A = [~{&~A~^, ~}]() ~A();"
-                                    (cpp-argnamicate (car binding))
-                                    (mapcar #'cpp-argnamicate *routine-args*)
-                                    (let ((*should-return-result* t))
-                                      (expand-op 'cl:progn `(,(cadr binding)))))
-                    when *capture-previous-bindings*
-                      do (setf *routine-args* (push (car binding) *routine-args*)))))
-        (concatenate 'string
-                     "{"
-                     (ck-clle/string:indent
-                      (concatenate 'string
-                                   (format nil "~{~%~A~}"
-                                           cpp-bindings)
-                                   (let ((*routine-args*
-                                           (append *routine-args* (mapcar #'car bindings))))
-                                     (format nil "~{~%~A~}"
-                                             (expand-args body))))
-                      +indentation+)
-                     (format nil "~%}"))))))
-
-(define-control-op 'cl:let* (args)
-  (let ((*capture-previous-bindings* t))
-    (expand-op 'cl:let args)))
-
-(define-control-op 'cl:tagbody (args)
-  (let ((*tagbody-labels* *tagbody-labels*)
-        (*should-return-result* nil)
-        (result ""))
-    (loop for form in args
-          when (not (listp form))
-            do (let ((label-name
-                       (format nil "LABEL_~A"
-                               (cpp-alphanumericate (symbol-name (gensym (symbol-name form)))))))
-                 (push (cons form label-name) *tagbody-labels*)))
-    (loop for form in args
-          if (not (listp form))
-            do (setf result (format nil "~A~&~A:"
-                                    result
-                                    (cdr (assoc form *tagbody-labels*))))
-          else do
-            (setf result (format nil "~A~&~A"
-                                 result
-                                 (transpile-form form))))
-    result))
-
-;;; OPERATOR ALIASES
-
-(define-operator-alias 'cl:loop 'khazern-extrinsic:loop)
-
-;;; IGNORED OPERATORS
-
-(defmacro ignore-op-symbols (&rest op-syms)
-  `(progn
-     ,@(mapcar (lambda (op-sym)
-                 `(setf (gethash ',op-sym *ignored-ops-table*) t))
-               op-syms)))
-
-(defun ignored-op-symbol-p (op-sym)
-  (gethash op-sym *ignored-ops-table*))
-
-(ignore-op-symbols cl:declare cl:declaim)
+  ((cl:cons) (cons-cell-struct iostream))
+  ((cl:tagbody) (exception)))
